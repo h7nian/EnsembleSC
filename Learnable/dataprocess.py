@@ -54,15 +54,18 @@ class ImageNetDataset:
         base_model = base_model.to(device)
         base_model.eval()
         
+        calib_batch_size = min(512, self.args.batch_size)
+
         all_labels = []
         loader = DataLoader(
             dataset, 
-            batch_size=self.args.batch_size,
+            batch_size=calib_batch_size,
             num_workers=self.args.num_workers,
             pin_memory=True
         )
         
         logger.info("Creating calibration labels...")
+
         with torch.no_grad():
             for inputs, targets in tqdm(loader, desc="Creating calibration labels"):
                 inputs = inputs.to(device, non_blocking=True)
@@ -73,6 +76,9 @@ class ImageNetDataset:
                 binary_labels = 2 * (predictions == targets).float() - 1
                 all_labels.append(binary_labels.cpu())
                 
+                del outputs, predictions
+                torch.cuda.empty_cache()
+
         return torch.cat(all_labels)
 
     def split_validation_set(self, dataset: Dataset) -> Tuple[list, list]:
@@ -145,7 +151,7 @@ class ImageNetDataset:
             'num_cal_samples': len(cal_indices),
             'num_val_samples': len(val_indices)
         }
-        torch.save(metadata, save_path / 'metadata.pt')
+        torch.save(metadata, save_path / 'metadata.pt', _use_new_zipfile_serialization=True)
         
         logger.info(f"Saved calibration data to {save_path}")
         logger.info(f"Metadata: {metadata}")
@@ -179,7 +185,12 @@ class ImageNetDataset:
             return None
             
         # Load metadata and verify compatibility
-        metadata = torch.load(load_path / 'metadata.pt')
+        try:
+            metadata = torch.load(load_path / 'metadata.pt', weights_only=True, 
+                                map_location='cpu')
+        except RuntimeError:
+            metadata = torch.load(load_path / 'metadata.pt', map_location='cpu')
+
         if (metadata['cal_size'] != self.args.cal_size or 
             metadata['model_name'] != self.args.model_name):
             logger.warning("Cached calibration data parameters don't match current settings")
@@ -191,7 +202,12 @@ class ImageNetDataset:
         # Load the data
         cal_indices = np.load(load_path / 'cal_indices.npy').tolist()
         val_indices = np.load(load_path / 'val_indices.npy').tolist()
-        binary_labels = torch.load(load_path / 'binary_labels.pt')
+
+        try:
+            binary_labels = torch.load(load_path / 'binary_labels.pt', weights_only=True,
+                                    map_location='cpu')
+        except RuntimeError:
+            binary_labels = torch.load(load_path / 'binary_labels.pt', map_location='cpu')
         
         logger.info(f"Loaded calibration data from {load_path}")
         logger.info(f"Loaded data sizes - Calibration: {len(cal_indices)}, "
@@ -228,24 +244,31 @@ class ImageNetDataset:
             cal_indices, val_indices, binary_labels = cached_data
         else:
             logger.info("Creating new calibration data")
-            # Split into calibration and new validation sets
             cal_indices, val_indices = self.split_validation_set(val_dataset)
-            
-            # Create subset datasets
             calibration_subset = Subset(val_dataset, cal_indices)
+
+            # 
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                binary_labels = self.create_calibration_labels(calibration_subset, base_model)
             
-            # Create binary labels for calibration set
-            binary_labels = self.create_calibration_labels(calibration_subset, base_model)
-            
+            if torch.distributed.is_initialized():
+                if torch.distributed.get_rank() == 0:
+                    torch.distributed.broadcast_object_list([binary_labels], src=0)
+                else:
+                    binary_labels_list = [None]
+                    torch.distributed.broadcast_object_list(binary_labels_list, src=0)
+                    binary_labels = binary_labels_list[0]
+
             # Save the calibration data if cache_dir is specified
             if hasattr(self.args, 'cache_dir') and self.args.cache_dir is not None:
-                self.save_calibration_data(
-                    self.args.cache_dir,
-                    cal_indices,
-                    val_indices,
-                    binary_labels
-                )
-        
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    self.save_calibration_data(
+                        self.args.cache_dir,
+                        cal_indices,
+                        val_indices,
+                        binary_labels
+                    )
+
         # Create datasets
         calibration_dataset = CalibrationDataset(
             Subset(val_dataset, cal_indices),
@@ -253,19 +276,30 @@ class ImageNetDataset:
         )
         validation_dataset = Subset(val_dataset, val_indices)
         
-        # Create dataloaders
+        # Create dataloaders with DistributedSampler if using distributed training
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            calibration_dataset
+        ) if self.args.local_rank != -1 else None
+        
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            validation_dataset, shuffle=False
+        ) if self.args.local_rank != -1 else None
+        
         dataloaders = {
             'calibration': DataLoader(
                 calibration_dataset,
                 batch_size=self.args.batch_size,
-                shuffle=True,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
                 num_workers=self.args.num_workers,
-                pin_memory=True
+                pin_memory=True,
+                drop_last=True  # Important for DDP
             ),
             'validation': DataLoader(
                 validation_dataset,
                 batch_size=self.args.batch_size,
                 shuffle=False,
+                sampler=val_sampler,
                 num_workers=self.args.num_workers,
                 pin_memory=True
             )

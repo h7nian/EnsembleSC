@@ -2,9 +2,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from typing import Dict, Any
+from pathlib import Path
 import logging
 from tqdm import tqdm
 import numpy as np
+
+from utils import calculate_rc_curve, plot_combined_rc_curves, evaluate_at_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -14,151 +17,218 @@ class SelectiveTrainer:
         model: nn.Module,
         learning_rate: float,
         device: str,
-        val_interval: int = 1  # Add validation interval parameter
+        output_dir: Path,
+        base_metrics: Dict,
+        val_interval: int = 1,
+        model_type: str = "EnsembleSC",
+        args: Any = None
     ):
-        self.model = model.to(device)
+        
+        self.args = args
         self.device = device
+        self.output_dir = output_dir
+        self.base_metrics = base_metrics
         self.val_interval = val_interval
-        self.optimizer = torch.optim.Adam([
-            {'params': self.model.selector_weights},
-            {'params': self.model.selector_thresholds},
-            {'params': self.model.ensemble_threshold}
-        ], lr=learning_rate)
+        self.model_type = model_type
+
+        model = model.to(device)
+
+        if args and args.local_rank != -1:
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+                find_unused_parameters=True 
+            )
+        elif torch.cuda.device_count() > 1:
+            if args and args.local_rank in [-1, 0]:
+                logger.info(f"Using {torch.cuda.device_count()} GPUs!")
+            self.model = nn.DataParallel(model)
+        else:
+            self.model = model
+
+        model_to_optimize = self.model.module if isinstance(
+            self.model, (nn.DataParallel, nn.parallel.DistributedDataParallel)
+        ) else self.model
+
+        if model_type == "EnsembleSC":
+            optimizer_params = list(model_to_optimize.score_network.parameters())
+        elif model_type == "EnsembleSC-Learnable": 
+            optimizer_params = [
+                {'params': model_to_optimize.score_network.parameters()},
+                {'params': model_to_optimize.selector_thresholds}
+            ]
         
-    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
-        """Train for one epoch."""
-        self.model.train()
-        total_loss = 0
-        correct = 0
-        selected = 0
-        total = 0
-        
-        for inputs, targets, binary_labels in tqdm(train_loader, desc="Training"):
-            inputs = inputs.to(self.device)
-            targets = targets.to(self.device)
-            binary_labels = binary_labels.to(self.device)
-            
-            # Forward pass
-            logits, selection_scores = self.model(inputs)
-            
-            # Compute hinge loss
-            hinge_loss = torch.mean(torch.clamp(1 - binary_labels * selection_scores, min=0))
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            hinge_loss.backward()
-            self.optimizer.step()
-            
-            # Compute metrics
-            total_loss += hinge_loss.item()
-            predictions = logits.argmax(dim=1)
-            selected_mask = selection_scores > 0
-            
-            correct += ((predictions == targets) & selected_mask).sum().item()
-            selected += selected_mask.sum().item()
-            total += len(inputs)
-            
-        # Compute epoch metrics
-        metrics = {
-            'loss': total_loss / len(train_loader),
-            'accuracy': correct / selected if selected > 0 else 0,
-            'coverage': selected / total
-        }
-        
-        return metrics
+        self.optimizer = torch.optim.Adam(optimizer_params, lr=learning_rate)
     
-    def evaluate(self, val_loader: DataLoader) -> Dict[str, Any]:
-        """Evaluate the model including individual selector performances."""
+    def evaluate(self, val_loader: DataLoader, threshold: float = None) -> Dict[str, Any]:
+        """Evaluate the model."""
         self.model.eval()
-        correct = 0
-        selected = 0
-        total = 0
-        
-        # Store scores for each selector and ensemble
-        selector_names = ['sr-max', 'sr-doctor', 'sr-entropy', 'rl-geom', 'rl-confm', 'ensemble']
-        all_scores = {name: [] for name in selector_names}
+        all_scores = []
         all_correct = []
         
-        with torch.no_grad():
-            for inputs, targets in tqdm(val_loader, desc="Evaluating"):
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            for inputs, targets in tqdm(val_loader, desc="Evaluating",
+                                      disable=not (not torch.distributed.is_initialized() 
+                                                 or torch.distributed.get_rank() == 0)):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
-                # Get base model predictions and individual selector scores
-                logits = self.model.base_model(inputs)
+                logits, scores = self.model(inputs)
                 predictions = logits.argmax(dim=1)
-                correct_mask = predictions == targets
+                correct = predictions == targets
                 
-                # Get individual selector scores
-                for idx, selector in enumerate(self.model.selectors):
-                    scores = selector(logits)
-                    # normalized_scores = torch.tanh(scores - self.model.selector_thresholds[idx])
-                    normalized_scores = scores - self.model.selector_thresholds[idx]
-                    all_scores[selector_names[idx]].extend(normalized_scores.cpu().numpy())
+                all_scores.extend(scores.cpu().numpy())
+                all_correct.extend(correct.cpu().numpy())
                 
-                # Get ensemble scores
-                _, _, selection_scores = self.model.predict_with_selection(inputs)
-                all_scores['ensemble'].extend(selection_scores.cpu().numpy())
-                
-                # Store correctness
-                all_correct.extend(correct_mask.cpu().numpy())
-                
-                # Compute metrics for ensemble selection
-                selected_mask = selection_scores > 0
-                correct += (correct_mask & selected_mask).sum().item()
-                selected += selected_mask.sum().item()
-                total += len(inputs)
+                del logits, scores, predictions, correct
+                torch.cuda.empty_cache()
         
-        # Create metrics dictionary
+        coverages, risks, thresholds = calculate_rc_curve(all_scores, all_correct)
+        
         metrics = {
-            'accuracy': correct / selected if selected > 0 else 0,
-            'coverage': selected / total,
-            'correct': all_correct
+            'scores': np.array(all_scores),
+            'correct': np.array(all_correct),
+            'coverages': coverages,
+            'risks': risks,
+            'thresholds': thresholds
         }
-        
-        # Add scores for each selector
-        for name in selector_names:
-            metrics[f'{name}_scores'] = all_scores[name]
         
         return metrics
     
-    def train(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        n_epochs: int
-    ) -> Dict[str, Any]:
-        """Train the model for multiple epochs."""
-        best_metrics = None
-        train_metrics_history = []
-        val_metrics_history = []
-        
-        for epoch in range(n_epochs):
-            logger.info(f"\nEpoch {epoch+1}/{n_epochs}")
+    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
+            """Train for one epoch."""
+            self.model.train()
+            total_loss = 0
+            all_scores = []
+            all_correct = []
             
-            # Train
-            train_metrics = self.train_epoch(train_loader)
-            logger.info(f"Train - Loss: {train_metrics['loss']:.4f}, "
-                       f"Accuracy: {train_metrics['accuracy']:.4f}, "
-                       f"Coverage: {train_metrics['coverage']:.4f}")
-            
-            # Store metrics
-            train_metrics_history.append(train_metrics)
-            
-            # Evaluate periodically
-            if (epoch + 1) % self.val_interval == 0:
-                val_metrics = self.evaluate(val_loader)
-                logger.info(f"Val - Accuracy: {val_metrics['accuracy']:.4f}, "
-                          f"Coverage: {val_metrics['coverage']:.4f}")
-                val_metrics_history.append(val_metrics)
+            for inputs, targets, binary_labels in tqdm(train_loader, desc="Training",
+                                                    disable=not (not torch.distributed.is_initialized() 
+                                                                or torch.distributed.get_rank() == 0)):
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                binary_labels = binary_labels.to(self.device)
                 
-                # Update best metrics
-                if (best_metrics is None or 
-                    val_metrics['accuracy'] > best_metrics['accuracy']):
-                    best_metrics = val_metrics
-        
-        return {
-            'train_history': train_metrics_history,
-            'val_history': val_metrics_history,
-            'best_metrics': best_metrics
-        }
+                logits, selection_scores = self.model(inputs)
+                
+                # Compute hinge loss
+                hinge_loss = torch.mean(torch.clamp(1 - binary_labels * selection_scores, min=0))
+                
+                self.optimizer.zero_grad()
+                hinge_loss.backward()
+                self.optimizer.step()
+                
+                total_loss += hinge_loss.item()
+                predictions = logits.argmax(dim=1)
+                correct = predictions == targets
+                
+                all_scores.extend(selection_scores.detach().cpu().numpy())
+                all_correct.extend(correct.cpu().numpy())
+
+                del logits, selection_scores, predictions, correct
+                torch.cuda.empty_cache()
+            
+            # Calculate metrics using risk-coverage curve
+            coverages, risks, _ = calculate_rc_curve(all_scores, all_correct)
+            
+            metrics = {
+                'loss': total_loss / len(train_loader),
+                'risk': np.mean(risks),
+                'coverage': np.mean(coverages)
+            }
+            
+            return metrics
+
+    def train(
+            self,
+            train_loader: DataLoader,
+            val_loader: DataLoader,
+            n_epochs: int,
+            target_coverage: float = 0.8
+        ) -> Dict[str, Any]:
+            """Train the model for multiple epochs."""
+            best_metrics = None
+            train_metrics_history = []
+            val_metrics_history = []
+            best_risk = float('inf')
+            
+            for epoch in range(n_epochs):
+                logger.info(f"\nEpoch {epoch+1}/{n_epochs}")
+                
+                if hasattr(train_loader, 'sampler') and isinstance(
+                    train_loader.sampler, torch.utils.data.distributed.DistributedSampler
+                ):
+                    train_loader.sampler.set_epoch(epoch)
+                
+                # Train
+                train_metrics = self.train_epoch(train_loader)
+                train_metrics_history.append(train_metrics)
+                if self.args.local_rank in [-1, 0]:
+                    logger.info(f"\nEpoch {epoch+1}/{n_epochs}")
+                    logger.info(f"Train - Loss: {train_metrics['loss']:.4f}")
+                    
+                    # Print selector weights
+                    model_to_print = (
+                        self.model.module if isinstance(self.model, (nn.DataParallel, nn.parallel.DistributedDataParallel))
+                        else self.model
+                    )
+                    selector_importance = model_to_print.get_selector_importance()
+                    logger.info("\nSelector Importance:")
+                    for name, importance in selector_importance:
+                        logger.info(f"{name:10s}: {importance:.4f}")
+                        
+                # Evaluate periodically
+                if (epoch + 1) % self.val_interval == 0:
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
+                    
+                    val_metrics = self.evaluate(val_loader)
+                    
+                    if self.args.local_rank in [-1, 0]:
+                        coverages, risks, thresholds = calculate_rc_curve(
+                            scores=val_metrics['scores'],
+                            correct=val_metrics['correct']
+                        )
+                        
+                        ensemble_metrics = evaluate_at_coverage(coverages, risks, thresholds, target_coverage)
+                        logger.info(f"Ensemble - Risk: {ensemble_metrics['risk']:.4f}, "
+                                f"Coverage: {ensemble_metrics['coverage']:.4f}")
+                        
+                        val_metrics.update({
+                            'threshold': ensemble_metrics['threshold'],
+                            'selected_risk': ensemble_metrics['risk'],
+                            'achieved_coverage': ensemble_metrics['coverage']
+                        })
+                        
+                        for name, metrics in self.base_metrics.items():
+                            target_metrics = evaluate_at_coverage(
+                                metrics['coverages'], 
+                                metrics['risks'], 
+                                metrics['thresholds'], 
+                                target_coverage
+                            )
+                            logger.info(f"{name:10s} - Risk: {target_metrics['risk']:.4f}, "
+                                    f"Coverage: {target_metrics['coverage']:.4f}")
+                        
+                        val_metrics_history.append(val_metrics)
+
+                        if ensemble_metrics['risk'] < best_risk:
+                            best_risk = ensemble_metrics['risk']
+                            best_metrics = val_metrics
+                            
+                            model_to_save = (
+                                self.model.module if isinstance(self.model, (nn.DataParallel, nn.parallel.DistributedDataParallel))
+                                else self.model
+                            )
+                            torch.save({
+                                'model_state_dict': model_to_save.state_dict(),
+                                'metrics': best_metrics,
+                                'threshold': ensemble_metrics['threshold']
+                            }, self.output_dir / f'{self.model_type}_best_model.pt')
+            
+            return {
+                'train_history': train_metrics_history,
+                'val_history': val_metrics_history,
+                'best_metrics': best_metrics
+            }
